@@ -1,0 +1,45 @@
+{
+  "device": "LSC 3224261",
+  "chip": "LN882H",
+  "led": "WS2805 RGB+CCT",
+  "pixels": 9,
+  "order": "BRGWC",
+  "pins": {
+    "data": 6,
+    "ir": 12,
+    "button": 21
+  },
+  "app_base": "458d0b7f74806af0845c9e492ceee37dbf3f4ded",
+  "sdk": "84149f251efc120561bdefa17ce399f62eadb8be",
+  "berry": "b9ce913d9d43bb296d9604bc0cb4f2f68a6b703f",
+  "compiler": "GCC Arm 10.3-2021.10",
+  "wire_bytes_per_pixel": 6,
+  "spi_mode": "1-line TX",
+  "reset_us": 320,
+  "files": {
+    "autoexec.bat": {
+      "bytes": 488,
+      "sha256": "f1e8994edac9124c1fa8e290d8577734dfe615ea0640fcae59f1df03554db089"
+    },
+    "firmware/OpenLN882H_WS2805.factory.bin": {
+      "bytes": 742592,
+      "sha256": "4b9ffef3bb73d12922e8a6f7a5bdc6446f32b9f72f6d6f1fbf7e409a1dbbd30f"
+    },
+    "firmware/OpenLN882H_WS2805.ota.bin": {
+      "bytes": 419833,
+      "sha256": "2ab21e37125ecbd02bd00b4677de1ae0a5cb4118e6f1efa4730e196e14615301"
+    },
+    "patch/OpenBeken_LN882H_WS2805.patch": {
+      "bytes": 36798,
+      "sha256": "85e99c0e3a79cd92cc29d4b0738890c43f9d7fb0d5b330c07eb4ae52e1604d4b"
+    },
+    "tools/build_ln882h_ws2805.py": {
+      "bytes": 2861,
+      "sha256": "53504bf919600dbf29fc9e6e3d0f4a8a54b07fd075661e8d8b3bba319cf8464a"
+    },
+    "tools/test_ws2805.py": {
+      "bytes": 9617,
+      "sha256": "12b7d129b306455fd5f7a9bf12402ca8e1f96f38613e2106de019f5f6013b2a5"
+    }
+  }
+}

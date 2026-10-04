@@ -1,0 +1,970 @@
+diff --git a/docs/ws2805_ln882h.md b/docs/ws2805_ln882h.md
+new file mode 100644
+index 0000000..5d8f883
+--- /dev/null
++++ b/docs/ws2805_ln882h.md
+@@ -0,0 +1,59 @@
++# WS2805 on LN882H (experimental)
++
++This driver supports 40-bit RGB+CCT pixels using the shared OpenBeken strip/UI
++backend. It is compiled with ENABLE_DRIVER_SM16703P on LN882H only. Use P6
++(PA6, SPI0 MOSI) with the existing SM16703P_DIN role. Stop other SPI strip drivers
++first. The driver rejects other pins and unsupported APB0 clock profiles.
++
++```
++SetPinRole 6 SM16703P_DIN
++SetPinRole 12 IRRecv
++SetPinRole 21 Btn_SmartLED
++SetFlag 4 1
++startDriver WS2805
++WS2805_Init 10 BRGWC
++WS2805_SetPixel all 255 0 0 0 0
++WS2805_Start
++startDriver TinyIR_NEC
++```
++
++SetPixel arguments are logical R G B C W, independently of wire order. Init
++accepts 1..255 pixels and requires a permutation of RGBCW (five unique channels).
++Pixel writes are staged; Start transmits the frame. SetRaw uses update, byte
++offset, and an even-length hex string in wire order. Invalid writes are rejected
++before any data changes. WS2805_Status logs readiness and the DMA failure count.
++Normal LED UI controls update all pixels; SmartButtonForLEDs uses that same UI
++state. NEC address/command pairs are logged and can be bound using AddEventHandler2.
++Leave P0 (microphone) unconfigured.
++
++The default SDK has APB0=40MHz. SPI /2 gives 20MHz, with 26 SPI bits per LED bit:
++zero = 7 high/19 low (350ns/950ns); one = 13 high/13 low (650ns/650ns).
++Each cell is 1.30us. Eight symbols pack into exactly 26 bytes, so neither source
++bytes nor pixels introduce a gap. 800 trailing zero bytes provide 320us reset.
++This satisfies the [Worldsemi timing limits](https://datasheet.lcsc.com/lcsc/2306301035_Worldsemi-WS2805_C5446697.pdf)
++assuming continuous SPI serialization at the computed clock. The frame is
++50 source bytes, 1300 encoded bytes plus 800 reset bytes for ten pixels, 840us.
++The reset bytes are transport padding, not an extra channel per pixel.
++
++DMA completion waits for TXE and clear BSY as well as the DMA count. Errors or
++deadlines disable DMA requests/channel 4, reset SPI0, hold the data pin low for
++350us and reinitialize for the next transfer. The RTOS tick deadline is frame
++duration + 10ms + rounding; a ten-pixel transfer is bounded to about 12ms plus
++scheduling and recovery. Polling yields to other tasks; interrupts remain enabled
++for the 50us NEC sampler. WS2805 protects its buffers against concurrent QuickTick,
++HTTP and shutdown callbacks using a retained mutex (one allocation across cycles).
++
++The legacy SM16703P encoder, prescaler and platform padding are unchanged. Its
++shutdown now disables the transport before freeing the DMA source, and byte
++access/allocation failures are checked. LN882H uses software NSS/SSI and TX-only
++mode, and no longer spins indefinitely on DMA failure. The shared DMA controller
++is not reset or clock-gated, so other channels can remain active.
++
++Software checks compile and execute the actual C encoder, checked DMA path, raw
++command and NEC ISR under ARM emulation with hardware mocks. These do not emulate
++the LN882H peripheral or verify electrical timing. Hardware acceptance remains:
++scope P6, verify both whites/order, first pixel/all ten, repeated start/init/stop,
++100+ updates with the HTTP UI, simultaneous IR reception, and DMA failure recovery.
++BRGWC and the pin mapping come from the supplied factory handoff; CW order is
++still a hardware hypothesis. Firmware is a test build, not hardware validated.
++
+diff --git a/platforms/obk_main.cmake b/platforms/obk_main.cmake
+index 679f893..6798240 100644
+--- a/platforms/obk_main.cmake
++++ b/platforms/obk_main.cmake
+@@ -131,6 +131,7 @@ set(OBKM_SRC
+ 	${OBK_SRCS}driver/drv_soft_spi.c
+ 	${OBK_SRCS}driver/drv_sm15155e.c
+ 	${OBK_SRCS}driver/drv_sm16703P.c
++	${OBK_SRCS}driver/drv_ws2805.c
+ 	${OBK_SRCS}driver/drv_simpleEEPROM.c
+ 	${OBK_SRCS}driver/drv_shutters.c
+ 	${OBK_SRCS}driver/drv_leds_shared.c
+diff --git a/src/cmnds/cmd_newLEDDriver.c b/src/cmnds/cmd_newLEDDriver.c
+index e22e68c..16be434 100644
+--- a/src/cmnds/cmd_newLEDDriver.c
++++ b/src/cmnds/cmd_newLEDDriver.c
+@@ -147,6 +147,9 @@ bool LED_IsLedDriverChipRunning()
+ 		|| DRV_IsRunning("TESTLED") || DRV_IsRunning("SM2235") || DRV_IsRunning("BP1658CJ")
+ 		|| DRV_IsRunning("KP18058")
+ 		|| DRV_IsRunning("SM16703P")
++#if ENABLE_DRIVER_SM16703P && PLATFORM_LN882H
++		|| DRV_IsRunning("WS2805")
++#endif
+ 		|| DRV_IsRunning("SM15155E")
+ 		|| DRV_IsRunning("DMX")
+ 		; 
+diff --git a/src/driver/drv_dmx512.c b/src/driver/drv_dmx512.c
+index 55409d7..a6d0115 100644
+--- a/src/driver/drv_dmx512.c
++++ b/src/driver/drv_dmx512.c
+@@ -103,7 +103,7 @@ void DMX_Init() {
+ 
+ 	g_dmxBuffer = (byte*)malloc(DMX_BUFFER_SIZE);
+ 	memset(g_dmxBuffer, 0, DMX_BUFFER_SIZE);
+-	ledStrip_t ws_export;
++	ledStrip_t ws_export = { 0 };
+ 	ws_export.apply = DMX_Show;
+ 	ws_export.getByte = DMX_GetByte;
+ 	ws_export.setByte = DMX_setByte;
+diff --git a/src/driver/drv_leds_shared.c b/src/driver/drv_leds_shared.c
+index 32a35ee..8113ce0 100644
+--- a/src/driver/drv_leds_shared.c
++++ b/src/driver/drv_leds_shared.c
+@@ -175,24 +175,31 @@ void Strip_setAllPixels(int r, int g, int b, int c, int w) {
+ // SM16703P_SetRaw bUpdate byteOfs HexData
+ // SM16703P_SetRaw 1 0 FF000000FF000000FF
+ commandResult_t Strip_CMD_setRaw(const void *context, const char *cmd, const char *args, int flags) {
+-	int ofs, bPush;
+ 	Tokenizer_TokenizeString(args, 0);
+-	bPush = Tokenizer_GetArgInteger(0);
+-	ofs = Tokenizer_GetArgInteger(1);
++	if (Tokenizer_GetArgsCount() != 3) return CMD_RES_NOT_ENOUGH_ARGUMENTS;
++	if (!led_backend.setByte || !pixel_count ||
++		(led_backend.isReady && !led_backend.isReady())) return CMD_RES_ERROR;
++	int bPush = Tokenizer_GetArgInteger(0);
++	int ofs = Tokenizer_GetArgInteger(1);
+ 	const char *s = Tokenizer_GetArg(2);
+-	int i = 0;
+-	// parse hex string like FFAABB0011 byte by byte
+-	while (s[0] && s[1]) {
+-		led_backend.setByte(i, hexbyte(s));
+-		i++;
+-		s += 2;
+-	}
+-	if (bPush) {
+-		led_backend.apply();
++	size_t n = strlen(s);
++	uint32_t capacity = pixel_count * pixel_size;
++	if ((n & 1) || ofs < 0 || (uint32_t)ofs > capacity ||
++		n / 2 > capacity - (uint32_t)ofs) return CMD_RES_BAD_ARGUMENT;
++	// Validate the whole write first; malformed input cannot partially alter pixels.
++	for (size_t i = 0; i < n; i++) {
++		char c = s[i];
++		if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') ||
++			(c >= 'a' && c <= 'f'))) return CMD_RES_BAD_ARGUMENT;
+ 	}
++	for (size_t i = 0; i < n / 2; i++) led_backend.setByte(ofs + i, hexbyte(s + i * 2));
++	if (bPush) led_backend.apply();
+ 	return CMD_RES_OK;
+ }
++
+ commandResult_t Strip_CMD_setPixel(const void *context, const char *cmd, const char *args, int flags) {
++	if (!led_backend.setByte || !pixel_count ||
++		(led_backend.isReady && !led_backend.isReady())) return CMD_RES_ERROR;
+ 	int i, r, g, b, c, w;
+ 	int pixel = 0;
+ 	const char *all = 0;
+@@ -210,6 +217,7 @@ commandResult_t Strip_CMD_setPixel(const void *context, const char *cmd, const c
+ 	}
+ 	else {
+ 		pixel = Tokenizer_GetArgInteger(0);
++		if (pixel < 0 || (uint32_t)pixel >= pixel_count) return CMD_RES_BAD_ARGUMENT;
+ 		all = 0;
+ 	}
+ 	r = Tokenizer_GetArgIntegerRange(1, 0, 255);
+@@ -256,10 +264,23 @@ commandResult_t Strip_CMD_InitForLEDCount(const void *context, const char *cmd,
+ 		return CMD_RES_NOT_ENOUGH_ARGUMENTS;
+ 	}
+ 
+-	//SM16703P_Shutdown();
++	if (!led_backend.setLEDCount) return CMD_RES_ERROR;
++	int count = Tokenizer_GetArgInteger(0);
++	const char *fmt = Tokenizer_GetArgsCount() > 1 ? Tokenizer_GetArg(1) : "RGB";
++	size_t len = strlen(fmt);
++	if (count < 1 || count > 255 || len < 1 || len > 5 ||
++		(led_backend.requiredPixelSize && len != led_backend.requiredPixelSize)) return CMD_RES_BAD_ARGUMENT;
++	unsigned int seen = 0;
++	static const char channels[] = "RGBCW";
++	for (size_t k = 0; k < len; k++) {
++		const char *ch = strchr(channels, fmt[k]);
++		if (!ch) return CMD_RES_BAD_ARGUMENT;
++		unsigned int mask = 1U << (ch - channels);
++		if (seen & mask) return CMD_RES_BAD_ARGUMENT;
++		seen |= mask;
++	}
+ 
+ 	// First arg: number of pixel to address
+-	pixel_count = Tokenizer_GetArgIntegerRange(0, 0, 255);
+ 	// Second arg (optional, default "RGB"): pixel format of "RGB" or "GRB"
+ 	if (Tokenizer_GetArgsCount() > 1) {
+ 		const char *format = Tokenizer_GetArg(1);
+@@ -299,7 +320,17 @@ commandResult_t Strip_CMD_InitForLEDCount(const void *context, const char *cmd,
+ 		}
+ 		color_channel_order = new_channel_order;
+ 	}
++	if (Tokenizer_GetArgsCount() == 1) {
++		if (color_channel_order != default_color_channel_order) os_free(color_channel_order);
++		color_channel_order = default_color_channel_order;
++		pixel_size = DEFAULT_PIXEL_SIZE;
++	}
++	pixel_count = count;
+ 	led_backend.setLEDCount(pixel_count, pixel_size);
++	if (led_backend.isReady && !led_backend.isReady()) {
++		pixel_count = 0;
++		return CMD_RES_ERROR;
++	}
+ 
+ 	ADDLOG_INFO(LOG_FEATURE_CMD, "Register driver with %i LEDs", pixel_count);
+ 
+@@ -314,9 +345,11 @@ bool Strip_IsActive() {
+ 	return false;
+ }
+ void Strip_Apply() {
+-	led_backend.apply();
++	if (led_backend.apply) led_backend.apply();
+ }
+ static commandResult_t Strip_CMD_StartTX(const void *context, const char *cmd, const char *args, int flags) {
++	if (!led_backend.apply || !pixel_count ||
++		(led_backend.isReady && !led_backend.isReady())) return CMD_RES_ERROR;
+ 	Strip_Apply();
+ 	return CMD_RES_OK;
+ }
+diff --git a/src/driver/drv_leds_shared.h b/src/driver/drv_leds_shared.h
+index 1d28c7f..09e144d 100644
+--- a/src/driver/drv_leds_shared.h
++++ b/src/driver/drv_leds_shared.h
+@@ -10,6 +10,9 @@ typedef struct ledStrip_s {
+ 	void (*setByte)(uint32_t idx, byte val);
+ 	void (*apply)();
+ 	void (*setLEDCount)(int pixel_count, int pixel_size);
++	// Optional validation of allocation/protocol-specific channel count.
++	bool (*isReady)();
++	int requiredPixelSize;
+ } ledStrip_t;
+ 
+ typedef enum ColorChannel {
+diff --git a/src/driver/drv_local.h b/src/driver/drv_local.h
+index 1e02258..ee6974b 100644
+--- a/src/driver/drv_local.h
++++ b/src/driver/drv_local.h
+@@ -75,6 +75,8 @@ void MultiPinI2CScanner_RunFrame();
+ void MultiPinI2CScanner_AppendInformationToHTTPIndexPage(http_request_t *request, int bPreState);
+ 
+ void SM16703P_Init();
++void WS2805_Init();
++void WS2805_Shutdown();
+ void SM16703P_Shutdown();
+ // set RGBCW values - Cold and Warm White are optional and might be ignored if hardware does not support them, or if
+ // channel order does not include them.
+diff --git a/src/driver/drv_main.c b/src/driver/drv_main.c
+index 80efd8d..d7b4001 100644
+--- a/src/driver/drv_main.c
++++ b/src/driver/drv_main.c
+@@ -789,6 +789,9 @@ static driver_t g_drivers[] = {
+ 	false,                                   // loaded
+ 	},
+ #endif
++#if ENABLE_DRIVER_SM16703P && PLATFORM_LN882H
++	{ "WS2805", WS2805_Init, NULL, NULL, NULL, WS2805_Shutdown, NULL, NULL, false },
++#endif
+ #if ENABLE_DRIVER_SM15155E
+ 	//drvdetail:{"name":"SM15155E",
+ 	//drvdetail:"title":"TODO",
+@@ -1789,6 +1792,14 @@ void DRV_StartDriver(const char* name) {
+ 				twinrunning=true;
+ 				break;
+ 			}
++#endif
++#if ENABLE_DRIVER_SM16703P && PLATFORM_LN882H
++			if ((!stricmp(name, "WS2805") && (DRV_IsRunning("SM16703P") || DRV_IsRunning("SM15155E"))) ||
++				((!stricmp(name, "SM16703P") || !stricmp(name, "SM15155E")) && DRV_IsRunning("WS2805"))) {
++				ADDLOG_ERROR(LOG_FEATURE_DRV, "Stop the active SPI strip driver first");
++				bStarted = 1;
++				break;
++			}
+ #endif
+ 			if (g_drivers[i].bLoaded) {
+ 				addLogAdv(LOG_INFO, LOG_FEATURE_MAIN, "Drv %s is already loaded.", name);
+diff --git a/src/driver/drv_pixelAnim.c b/src/driver/drv_pixelAnim.c
+index 29aeaf2..a159bcf 100644
+--- a/src/driver/drv_pixelAnim.c
++++ b/src/driver/drv_pixelAnim.c
+@@ -258,6 +258,7 @@ int g_speed = 0;
+ 
+ void PixelAnim_SetAnim(int j)
+ {
++	if (j < 0 || j >= g_numAnims) j = -1; // out-of-range index would read outside g_anims
+ 	activeAnim = j;
+ 	if(j >= 0)
+ 	{
+diff --git a/src/driver/drv_sm16703P.c b/src/driver/drv_sm16703P.c
+index 891ade2..cf65ef5 100644
+--- a/src/driver/drv_sm16703P.c
++++ b/src/driver/drv_sm16703P.c
+@@ -25,6 +25,7 @@ byte SM16703P_GetByte(uint32_t idx) {
+ 		return 0;
+ 	if (spiLED.ready == 0)
+ 		return 0;
++	if (idx >= spiLED.numBytes) return 0;
+ 	byte *input = spiLED.buf + spiLED.ofs + idx * 4;
+ 	byte ret = reverse_translate_byte(input);
+ 	return ret;
+@@ -34,6 +35,7 @@ void SM16703P_setByte(int index, byte color) {
+ 		return;
+ 	if (spiLED.ready == 0)
+ 		return;
++	if (index < 0 || (uint32_t)index >= spiLED.numBytes) return;
+ 	translate_byte(color, spiLED.buf + (spiLED.ofs + index * 4));
+ }
+ 
+@@ -53,21 +55,25 @@ void SM16703P_SetLEDCount(int pixel_count, int pixel_size) {
+ 
+ // startDriver SM16703P
+ // backlog startDriver SM16703P; SM16703P_Test
++static bool SM16703P_Ready() { return spiLED.ready != 0; }
++
+ void SM16703P_Init() {
+ 
+ 	int pin = PIN_FindPinIndexForRole(IOR_SM16703P_DIN, -1);
+ 	SPILED_Init(pin);
+ 
+-	ledStrip_t ws_export;
++	ledStrip_t ws_export = { 0 };
+ 	ws_export.apply = SM16703P_Show;
+ 	ws_export.getByte = SM16703P_GetByte;
+ 	ws_export.setByte = SM16703P_setByte;
+ 	ws_export.setLEDCount = SM16703P_SetLEDCount;
++	ws_export.isReady = SM16703P_Ready;
+ 
+ 	LEDS_InitShared(&ws_export);
+ }
+ 
+ void SM16703P_Shutdown() {
+ 	LEDS_ShutdownShared();
++	SPILED_Shutdown();
+ }
+ #endif
+diff --git a/src/driver/drv_spiLED.c b/src/driver/drv_spiLED.c
+index e734287..2ddcdbe 100644
+--- a/src/driver/drv_spiLED.c
++++ b/src/driver/drv_spiLED.c
+@@ -85,6 +85,7 @@ void SPILED_InitDMA(int numBytes) {
+ 	if (spiLED.ready) {
+ 		SPILED_Shutdown();
+ 	}
++	if (numBytes <= 0 || numBytes > 65535 / 4) return;
+ #if PLATFORM_BEKEN || PLATFORM_GD32VW553
+ 	spiLED.padding = 64;
+ #elif PLATFORM_REALTEK
+@@ -100,15 +101,21 @@ void SPILED_InitDMA(int numBytes) {
+ #elif PLATFORM_REALTEK
+ 	// memory for dma must be aligned to 32 bytes
+ 	orig_ptr = (byte*)os_malloc((sizeof(byte) * (buffer_size)) + 32 - 1);
++	if (!orig_ptr) return;
+ 	uint32_t misalignment = (uint32_t)orig_ptr % 32;
+ 	spiLED.buf = (orig_ptr + 32 - misalignment);
+ #elif PLATFORM_XRADIO
+ 	spiLED.buf = (byte*)os_malloc(sizeof(byte) * (buffer_size) + 8);
++	if (!spiLED.buf) return;
+ 	memset(spiLED.buf, 0, 8);
+ 	spiLED.buf += 8;
+ #else
+ 	spiLED.buf = (byte *)os_malloc(sizeof(byte) * (buffer_size)); //18LEDs x RGB x 4Bytes
+ #endif
++	if (!spiLED.buf) {
++		ADDLOG_ERROR(LOG_FEATURE_DRV, "SPI LED allocation failed");
++		return;
++	}
+ 
+ 	// Fill `spiLED.ofs` slice of the buffer with zero
+ 	for (i = 0; i < spiLED.ofs; i++) {
+@@ -124,18 +131,27 @@ void SPILED_InitDMA(int numBytes) {
+ 	}
+ 
+ 	spiLED.msg = os_malloc(sizeof(struct spi_message));
++	if (!spiLED.msg) {
++		SPILED_Shutdown();
++		ADDLOG_ERROR(LOG_FEATURE_DRV, "SPI LED message allocation failed");
++		return;
++	}
+ 	spiLED.msg->send_buf = spiLED.buf;
+ 	spiLED.msg->send_len = buffer_size;
+ 
+ 	SPIDMA_Init(spiLED.msg);
+ 
+ 	spiLED.ready = true;
++	spiLED.numBytes = numBytes;
+ }
+ 
+ 
+ 
+ 
+ void SPILED_SetRawBytes(int start_offset, byte *bytes, int numBytes, int push) {
++	if (!spiLED.ready || !bytes || start_offset < 0 || numBytes < 0 ||
++		(uint32_t)start_offset > spiLED.numBytes ||
++		(uint32_t)numBytes > spiLED.numBytes - (uint32_t)start_offset) return;
+ 	// start offset is in bytes, and we do 2 bits per dst byte, so *4
+ 	uint8_t *dst = spiLED.buf + spiLED.ofs + start_offset * 4;
+ 
+@@ -159,7 +175,12 @@ int spidma_led_pin = -1;
+ #endif
+ 
+ void SPILED_Shutdown() {
++	if (spiLED.ready) {
++		SPIDMA_StopTX();
++		SPIDMA_Deinit();
++	}
+ 	spiLED.ready = 0;
++	spiLED.numBytes = 0;
+ 	if (spiLED.buf) {
+ #if PLATFORM_REALTEK
+ 		os_free(orig_ptr);
+@@ -175,7 +196,6 @@ void SPILED_Shutdown() {
+ 		os_free(spiLED.msg);
+ 		spiLED.msg = 0;
+ 	}
+-	SPIDMA_Deinit();
+ }
+ 
+ void SPILED_Init(int pin) {
+@@ -199,4 +219,4 @@ void SPILED_Init(int pin) {
+ }
+ 
+ 
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/src/driver/drv_spiLED.h b/src/driver/drv_spiLED.h
+index aef930a..7eb80fe 100644
+--- a/src/driver/drv_spiLED.h
++++ b/src/driver/drv_spiLED.h
+@@ -4,6 +4,7 @@ typedef struct spiLED_s {
+ 	byte *buf;
+ 	struct spi_message *msg;
+ 	byte ready;
++	uint32_t numBytes;
+ 	// Number of empty bytes to send before pixel data on each frame
+ 	// Likely not needed as the data line should be LOW (reset) between frames anyway
+ 	uint32_t ofs;
+@@ -24,4 +25,4 @@ void SPILED_InitDMA(int numBytes);
+ void SPILED_SetRawHexString(int start_offset, const char *s, int push);
+ void SPILED_SetRawBytes(int start_offset, byte *bytes, int numBytes, int push);
+ void SPILED_Init(int pin);
+-void SPILED_Shutdown();
+\ No newline at end of file
++void SPILED_Shutdown();
+diff --git a/src/driver/drv_spidma.c b/src/driver/drv_spidma.c
+index bdd172a..d989ffe 100644
+--- a/src/driver/drv_spidma.c
++++ b/src/driver/drv_spidma.c
+@@ -610,13 +610,67 @@ void SPIDMA_Deinit(void)
+ #include "hal/hal_spi.h"
+ #include "utils/power_mgmt/ln_pm.h"
+ 
++#include "hal/hal_clock.h"
++#include "../hal/hal_generic.h"
++#include "../hal/hal_pins.h"
++#include "../logging/logging.h"
++
+ extern int spidma_led_pin;
+ static int current_pin = 6;
++static bool ws2805_mode;
++static bool ln_spi_initialized;
++static bool ln_full_duplex = true;
++
++void SPIDMA_LogStatus(void) {
++	lnPinMapping_t *pin = g_pins + current_pin;
++	ADDLOG_INFO(LOG_FEATURE_DRV, "SPI APB=%u CR1=%08X SR=%08X GPIO IEN=%05X DDR=%04X DSEL=%04X HP=%04X SEL6=%u",
++		(unsigned int)hal_clock_get_apb0_clk(), (unsigned int)spi_cr1_get(SPI0_BASE),
++		(unsigned int)spi_sr_get(SPI0_BASE), (unsigned int)sysc_cmp_func_ien_getf(),
++		gpio_ddr_getf(pin->base), gpio_dsel_getf(pin->base), gpio_hp_getf(pin->base),
++		(unsigned int)sysc_cmp_func_io06_sel_getf());
++}
++bool SPIDMA_SetDuplex(bool full) {
++	if (!ln_spi_initialized) return false;
++	SPIDMA_StopTX();
++	hal_spi_en(SPI0_BASE, HAL_DISABLE);
++	hal_spi_set_bidirectional_line(SPI0_BASE, full ? SPI_DIRECTION_2LINES_FULLDUPLEX : SPI_DIRECTION_1LINE_TX);
++	ln_full_duplex = full;
++	hal_spi_en(SPI0_BASE, HAL_ENABLE);
++	return true;
++}
++
++bool SPIDMA_SetWS2805Mode(bool enabled) {
++	// SPI0 is on APB0. Reject unsupported clock profiles rather than send bad pulses.
++	if (enabled && hal_clock_get_apb0_clk() != 40000000U) {
++		ADDLOG_ERROR(LOG_FEATURE_DRV, "WS2805 requires APB0 40MHz, got %u", (unsigned int)hal_clock_get_apb0_clk());
++		return false;
++	}
++	ws2805_mode = enabled;
++	// Hardware-verified: in full duplex SPI0 drives MOSI only while shifting,
++	// so P6 floated high between frames and WS2805 ICs stopped accepting data
++	// until power-cycled. 1-line TX keeps MOSI driven low while idle.
++	ln_full_duplex = !enabled;
++	return true;
++}
++
++void SPIDMA_StopTX(void) {
++	if (!ln_spi_initialized) return;
++	hal_dma_en(DMA_CH_4, HAL_DISABLE);
++	hal_spi_dma_en(SPI0_BASE, SPI_DMA_TX_EN, HAL_DISABLE);
++	hal_dma_clr_status_flag(DMA_CH_4, DMA_STATUS_FLAG_TRAN_GLOB);
++}
+ 
+ void SPIDMA_Init(struct spi_message* msg)
+ {
+-	current_pin = spidma_led_pin >= 0 ? spidma_led_pin : 6;
++	SPIDMA_StopTX();
++	if (ln_spi_initialized) hal_spi_en(SPI0_BASE, HAL_DISABLE);
++	current_pin = spidma_led_pin >= 0 && spidma_led_pin < PLATFORM_GPIO_MAX ? spidma_led_pin : 6;
+ 	lnPinMapping_t* pin = g_pins + current_pin;
++	HAL_PIN_Setup_Output(current_pin);
++	HAL_PIN_SetOutputValue(current_pin, 0);
++	// HAL_PIN_Setup_Output leaves the default pull-up, which pulls DATA high
++	// whenever the pad is not driven (AFIO switches the GPIO to input).
++	if (ws2805_mode) hal_gpio_pin_pull_set(pin->base, pin->pin, GPIO_PULL_DOWN);
+ 	soc_module_clk_gate_enable(CLK_G_SPI0);
+ 	soc_module_clk_gate_enable(CLK_G_DMA);
+ 
+@@ -625,7 +679,9 @@ void SPIDMA_Init(struct spi_message* msg)
+ 	
+ 	spi_init_type_def spi_init =
+ 	{
+-		.spi_baud_rate_prescaler = SPI_BAUDRATEPRESCALER_16,
++		.spi_baud_rate_prescaler = ws2805_mode ? SPI_BAUDRATEPRESCALER_2 : SPI_BAUDRATEPRESCALER_16,
++		.spi_direction = ln_full_duplex ? SPI_DIRECTION_2LINES_FULLDUPLEX : SPI_DIRECTION_1LINE_TX,
++		.spi_nss_mode = SPI_NSS_SOFT,
+ 		.spi_mode = SPI_MODE_MASTER,
+ 		.spi_data_size = SPI_DATASIZE_8B,
+ 		.spi_first_bit = SPI_FIRST_BIT_MSB,
+@@ -634,6 +690,8 @@ void SPIDMA_Init(struct spi_message* msg)
+ 	};
+ 	
+ 	hal_spi_init(SPI0_BASE, &spi_init);
++	// Software NSS must be high in master mode, otherwise MODF can stop SPI.
++	spi_ssi_setf(SPI0_BASE, 1);
+ 	hal_spi_en(SPI0_BASE, HAL_ENABLE);
+ 	hal_spi_ssoe_en(SPI0_BASE, HAL_DISABLE);
+ 	
+@@ -648,37 +706,66 @@ void SPIDMA_Init(struct spi_message* msg)
+ 		.dma_mem_size = DMA_MEM_SIZE_8_BIT,
+ 	};
+ 	
++	ln_spi_initialized = true;
+ 	hal_dma_init(DMA_CH_4, &dma_init);
+ 	hal_dma_en(DMA_CH_4, HAL_DISABLE);
+ }
+ 
+-void SPIDMA_StartTX(struct spi_message* msg)
+-{
++
++bool SPIDMA_StartTXChecked(struct spi_message* msg) {
++	if (!ln_spi_initialized || !msg || !msg->send_buf || !msg->send_len || msg->send_len > 65535U) return false;
++	SPIDMA_StopTX();
+ 	hal_dma_set_mem_addr(DMA_CH_4, (uint32_t)msg->send_buf);
+ 	hal_dma_set_data_num(DMA_CH_4, msg->send_len);
+-
+ 	hal_spi_dma_en(SPI0_BASE, SPI_DMA_TX_EN, HAL_ENABLE);
+ 	hal_dma_en(DMA_CH_4, HAL_ENABLE);
+-	
+-	while(hal_dma_get_data_num(DMA_CH_4) != 0);
+-	
+-	hal_dma_en(DMA_CH_4, HAL_DISABLE);
+-	hal_spi_dma_en(SPI0_BASE, SPI_DMA_TX_EN, HAL_DISABLE);
++	// Allow frame duration plus 10ms margin. Tick subtraction is wrap safe.
++	uint32_t hz = hal_clock_get_apb0_clk() / (ws2805_mode ? 2U : 16U);
++	TickType_t limit = pdMS_TO_TICKS((msg->send_len * 8000U + hz - 1) / hz + 10U) + 1;
++	TickType_t started = xTaskGetTickCount();
++	bool ok = true;
++	while (hal_dma_get_data_num(DMA_CH_4) != 0 ||
++		!hal_spi_get_status_flag(SPI0_BASE, SPI_STATUS_FLAG_TXE) ||
++		hal_spi_get_status_flag(SPI0_BASE, SPI_STATUS_FLAG_BSY)) {
++		if (hal_dma_get_status_flag(DMA_CH_4, DMA_STATUS_FLAG_TRAN_ERR) ||
++			(TickType_t)(xTaskGetTickCount() - started) >= limit) { ok = false; break; }
++		// DMA keeps running while network/IR tasks get CPU time.
++		vTaskDelay(1);
++	}
++	uint32_t remaining = hal_dma_get_data_num(DMA_CH_4);
++	SPIDMA_StopTX();
++	// In full-duplex mode the unused receiver overruns. Drain DR then SR to
++	// clear RXNE/OVR before the next frame; keep MOSI in the SDK's normal mode.
++	if (ln_full_duplex) {
++		(void)spi_dr_get(SPI0_BASE);
++		(void)spi_sr_get(SPI0_BASE);
++	}
++	if (!ok) {
++		ADDLOG_ERROR(LOG_FEATURE_DRV, "SPI DMA failed: len=%u remaining=%u", msg->send_len, (unsigned int)remaining);
++		// Reset only SPI0 and channel 4; other DMA users keep their resources.
++		hal_spi_en(SPI0_BASE, HAL_DISABLE);
++		hal_spi_deinit(SPI0_BASE);
++		hal_gpio_pin_afio_en(g_pins[current_pin].base, g_pins[current_pin].pin, HAL_DISABLE);
++		HAL_PIN_Setup_Output(current_pin);
++		HAL_PIN_SetOutputValue(current_pin, 0);
++		HAL_Delay_us(350);
++		SPIDMA_Init(msg);
++	}
++	return ok;
+ }
+ 
+-void SPIDMA_StopTX(void)
+-{
+-
+-}
++void SPIDMA_StartTX(struct spi_message* msg) { (void)SPIDMA_StartTXChecked(msg); }
+ 
+-void SPIDMA_Deinit(void)
+-{
++void SPIDMA_Deinit(void) {
++	if (!ln_spi_initialized) return;
++	SPIDMA_StopTX();
+ 	hal_spi_en(SPI0_BASE, HAL_DISABLE);
+ 	hal_spi_deinit(SPI0_BASE);
+-	lnPinMapping_t* pin = g_pins + current_pin;
+-	hal_gpio_pin_afio_en(pin->base, pin->pin, HAL_DISABLE);
+-	soc_module_clk_gate_disable(CLK_G_SPI0);
+-	soc_module_clk_gate_disable(CLK_G_DMA);
++	hal_gpio_pin_afio_en(g_pins[current_pin].base, g_pins[current_pin].pin, HAL_DISABLE);
++	HAL_PIN_Setup_Output(current_pin);
++	HAL_PIN_SetOutputValue(current_pin, 0);
++	// Do not gate/reset the shared DMA controller (e.g. UART can use other channels).
++	ln_spi_initialized = false;
+ }
+ 
+ #elif PLATFORM_REALTEK
+diff --git a/src/driver/drv_spidma.h b/src/driver/drv_spidma.h
+index e1771e5..8d89c01 100644
+--- a/src/driver/drv_spidma.h
++++ b/src/driver/drv_spidma.h
+@@ -69,6 +69,12 @@ struct spi_message
+ 
+ #endif
+ 
++#if PLATFORM_LN882H
++bool SPIDMA_StartTXChecked(struct spi_message *spi_msg);
++bool SPIDMA_SetWS2805Mode(bool enabled);
++void SPIDMA_LogStatus(void);
++bool SPIDMA_SetDuplex(bool full);
++#endif
+ void SPIDMA_Init(struct spi_message *spi_msg);
+ void SPIDMA_StartTX(struct spi_message *spi_msg);
+ void SPIDMA_StopTX(void);
+diff --git a/src/driver/drv_tinyir_nec.c b/src/driver/drv_tinyir_nec.c
+index cccfe60..9c75bfa 100644
+--- a/src/driver/drv_tinyir_nec.c
++++ b/src/driver/drv_tinyir_nec.c
+@@ -49,7 +49,7 @@ static uint32_t repeatCount = 0;
+ static bool possiblyHeld = false;
+ 
+ static uint32_t recvState = 0;
+-static bool irDataAvailable = false;
++static volatile bool irDataAvailable = false;
+ static struct
+ {
+ 	uint16_t addr;
+@@ -96,8 +96,6 @@ static void DRV_IR_ISR(void* arg)
+ 	{
+ 		if(within(duration_ticks, NEC_LEADER_MARK))
+ 		{
+-			// intentionally disable repeats
+-			possiblyHeld = false;
+ 			recvState = 1;
+ 		}
+ 		else if(recvState != 2)
+@@ -112,6 +110,7 @@ static void DRV_IR_ISR(void* arg)
+ 			case 1:
+ 				if(within(duration_ticks, NEC_LEADER_SPACE))
+ 				{
++					possiblyHeld = false;
+ 					bitCount = 0;
+ 					irSignal.all = 0;
+ 					repeatCount = 0;
+@@ -176,6 +175,8 @@ static void DRV_IR_ISR(void* arg)
+ 
+ void TinyIR_NEC_Init()
+ {
++	if(ir_chan >= 0) return;
++	recvpin = -1;
+ 	recvpin = PIN_FindPinIndexForRole(IOR_IRRecv, recvpin);
+ 	if(recvpin == -1)
+ 	{
+@@ -185,17 +186,28 @@ void TinyIR_NEC_Init()
+ 	else HAL_PIN_Setup_Input_Pullup(recvpin);
+ 
+ 	if(recvpin < 0) return;
++	timer_cnt = duration_ticks = bitCount = recvState = repeatCount = 0;
++	possiblyHeld = irDataAvailable = false;
+ 
+ 	last_level = digitalReadFast(recvpin);
+ 	ir_chan = HAL_RequestHWTimer(ir_periodus, &ir_periodus, DRV_IR_ISR, NULL);
++	if(ir_chan < 0) {
++		ADDLOG_ERROR(LOG_FEATURE_IR, "NEC: no free hardware timer");
++		return;
++	}
+ 	HAL_HWTimerStart(ir_chan);
+ 	ADDLOG_INFO(LOG_FEATURE_DRV, "NEC %u %.2f", ir_chan, ir_periodus);
+ }
+ 
+ void TinyIR_NEC_Deinit()
+ {
++	if(ir_chan < 0) return;
+ 	HAL_HWTimerStop(ir_chan);
+ 	HAL_HWTimerDeinit(ir_chan);
++	ir_chan = -1;
++	recvpin = -1;
++	recvState = 0;
++	possiblyHeld = irDataAvailable = false;
+ }
+ 
+ void TinyIR_NEC_RunFrame()
+diff --git a/src/driver/drv_ws2805.c b/src/driver/drv_ws2805.c
+new file mode 100644
+index 0000000..23a0fa4
+--- /dev/null
++++ b/src/driver/drv_ws2805.c
+@@ -0,0 +1,212 @@
++#include "../new_common.h"
++#include "../new_cfg.h"
++#include "../new_pins.h"
++#include "../cmnds/cmd_public.h"
++#include "../logging/logging.h"
++#include "drv_local.h"
++#include "drv_leds_shared.h"
++#include "drv_spidma.h"
++
++#if ENABLE_DRIVER_SM16703P && PLATFORM_LN882H
++#include "ws2805_encode.h"
++#include "hal/hal_clock.h"
++#include "hal/hal_gpio.h"
++#include "../hal/hal_pins.h"
++#include "../hal/hal_generic.h"
++
++// One-shot diagnostic only: copied into RAM by the SDK's .data* linker rule.
++// Absolute cycle deadlines avoid flash/cache latency and byte-boundary gaps.
++// IRQs are masked for <=520us (10 pixels); do not use as an IR-safe backend.
++__attribute__((section(".data.ws2805_probe"), noinline))
++static void WS2805_GPIOProbe(const byte *data, unsigned count, unsigned mhz) {
++	volatile uint32_t *bsrr = &((t_hwp_gpio_t*)GPIOA_BASE)->gpio_bsrr.val;
++	uint32_t deadline = DWT->CYCCNT + 64;
++	uint32_t cell = mhz * 13 / 10;
++	for (unsigned n=0; n<count; n++) {
++		for (unsigned mask=128; mask; mask>>=1) {
++			uint32_t high = (data[n] & mask) ? mhz * 7 / 10 : mhz * 3 / 10;
++			while ((int32_t)(DWT->CYCCNT - deadline) < 0) { }
++			*bsrr = GPIO_PIN_6;
++			uint32_t falling = deadline + high;
++			while ((int32_t)(DWT->CYCCNT - falling) < 0) { }
++			*bsrr = (uint32_t)GPIO_PIN_6 << 16;
++			deadline += cell;
++		}
++	}
++}
++
++extern int spidma_led_pin;
++extern commandResult_t Strip_CMD_InitForLEDCount(const void *, const char *, const char *, int);
++extern commandResult_t Strip_CMD_setPixel(const void *, const char *, const char *, int);
++extern commandResult_t Strip_CMD_setRaw(const void *, const char *, const char *, int);
++static byte *raw;
++static struct spi_message tx;
++static uint32_t source_bytes;
++static uint32_t failures;
++static bool active;
++static bool last_send_ok;
++// Retained across start/stop, like the core driver mutex. One allocation only;
++// callbacks already queued by HTTP/QuickTick can safely lock after shutdown.
++static SemaphoreHandle_t buffer_mutex;
++
++static bool WS2805_Ready() { return active && raw && tx.send_buf; }
++
++static void WS2805_FreeBuffers() {
++	SPIDMA_StopTX();
++	SPIDMA_Deinit();
++	os_free(raw);
++	os_free(tx.send_buf);
++	raw = NULL;
++	memset(&tx, 0, sizeof(tx));
++	source_bytes = 0;
++}
++
++static byte WS2805_GetByte(uint32_t idx) {
++	if (!buffer_mutex) return 0;
++	xSemaphoreTake(buffer_mutex, portMAX_DELAY);
++	byte value = WS2805_Ready() && idx < source_bytes ? raw[idx] : 0;
++	xSemaphoreGive(buffer_mutex);
++	return value;
++}
++static void WS2805_SetByte(uint32_t idx, byte val) {
++	if (!buffer_mutex) return;
++	xSemaphoreTake(buffer_mutex, portMAX_DELAY);
++	if (WS2805_Ready() && idx < source_bytes) raw[idx] = val;
++	xSemaphoreGive(buffer_mutex);
++}
++// Wire byte n of the 6-byte-per-pixel frame; every sixth byte is the zero pad.
++static byte WS2805_WireByte(uint32_t n) {
++	uint32_t ch = n % WS2805_WIRE_BYTES_PER_PIXEL;
++	return ch < WS2805_CHANNELS ? raw[n / WS2805_WIRE_BYTES_PER_PIXEL * WS2805_CHANNELS + ch] : 0;
++}
++static void WS2805_Show() {
++	if (!buffer_mutex) return;
++	xSemaphoreTake(buffer_mutex, portMAX_DELAY);
++	last_send_ok = false;
++	if (!WS2805_Ready()) { xSemaphoreGive(buffer_mutex); return; }
++	uint32_t wire_bytes = source_bytes / WS2805_CHANNELS * WS2805_WIRE_BYTES_PER_PIXEL;
++	for (uint32_t i = 0; i < wire_bytes; i++)
++		WS2805_EncodeByte(WS2805_WireByte(i), tx.send_buf + i * WS2805_ENCODED_BYTES);
++	last_send_ok = SPIDMA_StartTXChecked(&tx);
++	if (!last_send_ok) failures++;
++	xSemaphoreGive(buffer_mutex);
++}
++static void WS2805_SetCount(int count, int size) {
++	xSemaphoreTake(buffer_mutex, portMAX_DELAY);
++	WS2805_FreeBuffers();
++	if (!active || count < 1 || count > 255 || size != 5) { xSemaphoreGive(buffer_mutex); return; }
++	source_bytes = count * WS2805_CHANNELS;
++	tx.send_len = count * WS2805_WIRE_BYTES_PER_PIXEL * WS2805_ENCODED_BYTES + WS2805_RESET_BYTES;
++	raw = os_malloc(source_bytes);
++	tx.send_buf = os_malloc(tx.send_len);
++	if (!raw || !tx.send_buf) {
++		WS2805_FreeBuffers();
++		ADDLOG_ERROR(LOG_FEATURE_DRV, "WS2805 allocation failed");
++		xSemaphoreGive(buffer_mutex);
++		return;
++	}
++	memset(raw, 0, source_bytes);
++	memset(tx.send_buf, 0, tx.send_len);
++	SPIDMA_Init(&tx);
++	ADDLOG_INFO(LOG_FEATURE_DRV, "WS2805 %d pixels, 6 wire bytes/pixel, SPI=20MHz, cell=1300ns, reset=320us", count);
++	xSemaphoreGive(buffer_mutex);
++}
++static commandResult_t WS2805_CMD_Init(const void *ctx, const char *cmd, const char *args, int flags) {
++	if (!active) return CMD_RES_ERROR;
++	return Strip_CMD_InitForLEDCount(ctx, cmd, args, flags);
++}
++static commandResult_t WS2805_CMD_Start(const void *ctx, const char *cmd, const char *args, int flags) {
++	WS2805_Show();
++	return last_send_ok ? CMD_RES_OK : CMD_RES_ERROR;
++}
++static commandResult_t WS2805_CMD_Pixel(const void *ctx, const char *cmd, const char *args, int flags) {
++	if (!active) return CMD_RES_ERROR;
++	return Strip_CMD_setPixel(ctx, cmd, args, flags);
++}
++static commandResult_t WS2805_CMD_Raw(const void *ctx, const char *cmd, const char *args, int flags) {
++	if (!active) return CMD_RES_ERROR;
++	commandResult_t result = Strip_CMD_setRaw(ctx, cmd, args, flags);
++	if (result == CMD_RES_OK && Tokenizer_GetArgInteger(0) && !last_send_ok) return CMD_RES_ERROR;
++	return result;
++}
++static commandResult_t WS2805_CMD_Status(const void *ctx, const char *cmd, const char *args, int flags) {
++	if (buffer_mutex) xSemaphoreTake(buffer_mutex, portMAX_DELAY);
++	ADDLOG_INFO(LOG_FEATURE_DRV, "WS2805 ready=%d bytes=%u DMA failures=%u", WS2805_Ready(),
++		(unsigned int)source_bytes, (unsigned int)failures);
++	SPIDMA_LogStatus();
++	if (WS2805_Ready()) ADDLOG_INFO(LOG_FEATURE_DRV, "WS2805 first wire bytes %02X %02X %02X %02X %02X", raw[0],raw[1],raw[2],raw[3],raw[4]);
++	if (buffer_mutex) xSemaphoreGive(buffer_mutex);
++	return CMD_RES_OK;
++}
++static commandResult_t WS2805_CMD_Duplex(const void *ctx, const char *cmd, const char *args, int flags) {
++	Tokenizer_TokenizeString(args, 0);
++	if (!active || Tokenizer_GetArgsCount() != 1) return CMD_RES_BAD_ARGUMENT;
++	int mode = Tokenizer_GetArgInteger(0);
++	if (mode < 0 || mode > 1) return CMD_RES_BAD_ARGUMENT;
++	xSemaphoreTake(buffer_mutex, portMAX_DELAY);
++	bool ok = SPIDMA_SetDuplex(mode != 0);
++	xSemaphoreGive(buffer_mutex);
++	return ok ? CMD_RES_OK : CMD_RES_ERROR;
++}
++static commandResult_t WS2805_CMD_GPIOProbe(const void *ctx, const char *cmd, const char *args, int flags) {
++	if (!buffer_mutex) return CMD_RES_ERROR;
++	xSemaphoreTake(buffer_mutex, portMAX_DELAY);
++	if (!WS2805_Ready() || source_bytes > 50) { xSemaphoreGive(buffer_mutex); return CMD_RES_ERROR; }
++	CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
++	DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
++	uint32_t before = DWT->CYCCNT;
++	for (volatile int i=0; i<100; i++) __NOP();
++	unsigned mhz = hal_clock_get_core_clk()/1000000U;
++	if (DWT->CYCCNT == before || mhz < 80 || mhz > 160) { xSemaphoreGive(buffer_mutex); return CMD_RES_ERROR; }
++	byte wire[10 * WS2805_WIRE_BYTES_PER_PIXEL];
++	unsigned wire_bytes = source_bytes / WS2805_CHANNELS * WS2805_WIRE_BYTES_PER_PIXEL;
++	for (unsigned i = 0; i < wire_bytes; i++) wire[i] = WS2805_WireByte(i);
++	SPIDMA_Deinit();
++	vTaskDelay(pdMS_TO_TICKS(5)+1);
++	uint32_t irq = __get_PRIMASK();
++	__disable_irq();
++	WS2805_GPIOProbe(wire, wire_bytes, mhz);
++	__set_PRIMASK(irq);
++	vTaskDelay(pdMS_TO_TICKS(5)+1);
++	SPIDMA_Init(&tx);
++	ADDLOG_INFO(LOG_FEATURE_DRV, "WS2805 GPIO probe: %u bytes core=%uMHz (one-shot, waveform unmeasured)", (unsigned int)source_bytes,mhz);
++	xSemaphoreGive(buffer_mutex);
++	return CMD_RES_OK;
++}
++void WS2805_Init() {
++	int pin = PIN_FindPinIndexForRole(IOR_SM16703P_DIN, -1);
++	if (pin != 6 || Strip_IsActive() || !SPIDMA_SetWS2805Mode(true)) {
++		ADDLOG_ERROR(LOG_FEATURE_DRV, "WS2805 needs P6=SM16703P_DIN and no active strip backend");
++		return;
++	}
++	spidma_led_pin = pin;
++	if (!buffer_mutex) buffer_mutex = xSemaphoreCreateMutex();
++	if (!buffer_mutex) { SPIDMA_SetWS2805Mode(false); return; }
++	active = true;
++	failures = 0;
++	ledStrip_t api = { 0 };
++	api.apply = WS2805_Show;
++	api.getByte = WS2805_GetByte;
++	api.setByte = WS2805_SetByte;
++	api.setLEDCount = WS2805_SetCount;
++	api.isReady = WS2805_Ready;
++	api.requiredPixelSize = 5;
++	LEDS_InitShared(&api);
++	CMD_RegisterCommand("WS2805_Init", WS2805_CMD_Init, NULL);
++	CMD_RegisterCommand("WS2805_Start", WS2805_CMD_Start, NULL);
++	CMD_RegisterCommand("WS2805_Status", WS2805_CMD_Status, NULL);
++	CMD_RegisterCommand("WS2805_Duplex", WS2805_CMD_Duplex, NULL);
++	CMD_RegisterCommand("WS2805_GPIOProbe", WS2805_CMD_GPIOProbe, NULL);
++	CMD_RegisterCommand("WS2805_SetPixel", WS2805_CMD_Pixel, NULL);
++	CMD_RegisterCommand("WS2805_SetRaw", WS2805_CMD_Raw, NULL);
++}
++void WS2805_Shutdown() {
++	if (!active) return;
++	xSemaphoreTake(buffer_mutex, portMAX_DELAY);
++	active = false;
++	LEDS_ShutdownShared();
++	WS2805_FreeBuffers();
++	SPIDMA_SetWS2805Mode(false);
++	xSemaphoreGive(buffer_mutex);
++}
++#endif
+diff --git a/src/driver/ws2805_encode.h b/src/driver/ws2805_encode.h
+new file mode 100644
+index 0000000..c900bc3
+--- /dev/null
++++ b/src/driver/ws2805_encode.h
+@@ -0,0 +1,25 @@
++#pragma once
++#include <stdint.h>
++#include <string.h>
++
++// APB0=40MHz, SPI /2=20MHz (50ns per bit). Each source bit is 26 SPI
++// bits: 0 = 7 high + 19 low (350ns/950ns), 1 = 13 high + 13 low
++// (650ns/650ns). Cell=1.30us. Eight symbols occupy exactly 26 bytes,
++// so consecutive bytes/pixels have no artificial gaps. MSB first.
++#define WS2805_ENCODED_BYTES 26
++#define WS2805_RESET_BYTES 800 // 320us at 20MHz, margin above >280us
++// Hardware-verified: each WS2805 consumes 48 bits per pixel - five 8-bit
++// channels plus one trailing pad byte (NeoPixelBus Neo6xByteFeature). The
++// pad byte is always sent as 0. Five-byte frames shift colours between ICs.
++#define WS2805_CHANNELS 5
++#define WS2805_WIRE_BYTES_PER_PIXEL 6
++static void WS2805_EncodeByte(uint8_t value, uint8_t *dst) {
++	memset(dst, 0, WS2805_ENCODED_BYTES);
++	for (unsigned int bit = 0; bit < 8; bit++) {
++		unsigned int high = (value & (0x80U >> bit)) ? 13 : 7;
++		for (unsigned int i = 0; i < high; i++) {
++			unsigned int pos = bit * 26 + i;
++			dst[pos / 8] |= 0x80U >> (pos % 8);
++		}
++	}
++}
+diff --git a/src/httpserver/hass.c b/src/httpserver/hass.c
+index 17e50f0..063ccc1 100644
+--- a/src/httpserver/hass.c
++++ b/src/httpserver/hass.c
+@@ -832,7 +832,11 @@ HassDeviceInfo* hass_init_light_device_info(ENTITY_TYPE type) {
+ 	cJSON_AddNumberToObject(info->root, "bri_scl", brightness_scale);	//brightness_scale
+ 
+ #if ENABLE_DRIVER_PIXELANIM
+-	if((DRV_IsRunning("SM16703P") || DRV_IsRunning("DMX")) && DRV_IsRunning("PixelAnim"))
++	if((DRV_IsRunning("SM16703P") || DRV_IsRunning("DMX")
++#if ENABLE_DRIVER_SM16703P && PLATFORM_LN882H
++		|| DRV_IsRunning("WS2805")
++#endif
++		) && DRV_IsRunning("PixelAnim"))
+ 	{
+ 		cJSON_AddStringToObject(info->root, "fx_stat_t", "~/currentAnim/get");
+ 		sprintf(g_hassBuffer, "cmnd/%s/anim", CFG_GetMQTTClientId());
